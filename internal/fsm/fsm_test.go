@@ -144,6 +144,153 @@ func TestSnapshotRestore(t *testing.T) {
 	}
 }
 
+func TestBarrierRendezvousAdvanceAndRejections(t *testing.T) {
+	f := New()
+	now := time.Unix(2000, 0)
+
+	create := apply(t, f, Command{Type: CmdBarrierCreate, Barrier: "phase", Participants: []string{"b", "a"}, Now: now})
+	if !create.OK || create.Barrier == nil || create.Barrier.Round != 1 || create.Barrier.Status != BarrierWaiting {
+		t.Fatalf("create barrier: %+v", create)
+	}
+	if got := create.Barrier.Participants; len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("participants not normalized: %+v", got)
+	}
+	same := apply(t, f, Command{Type: CmdBarrierCreate, Barrier: "phase", Participants: []string{"a", "b"}, Now: now})
+	if !same.OK || same.Barrier.Round != 1 {
+		t.Fatalf("same barrier config must be idempotent: %+v", same)
+	}
+	diff := apply(t, f, Command{Type: CmdBarrierCreate, Barrier: "phase", Participants: []string{"a", "c"}, Now: now})
+	if diff.OK {
+		t.Fatalf("different barrier config must be rejected")
+	}
+
+	a := apply(t, f, Command{Type: CmdAcquire, Resource: "ra", Holder: "ha", TTL: 30, Now: now})
+	b := apply(t, f, Command{Type: CmdAcquire, Resource: "rb", Holder: "hb", TTL: 30, Now: now})
+	arriveA := apply(t, f, Command{
+		Type: CmdBarrierArrive, Barrier: "phase", ExpectedRound: 1, Participant: "a",
+		Resource: "ra", Holder: "ha", Token: a.Token, Now: now.Add(time.Second),
+	})
+	if !arriveA.OK || arriveA.Barrier.Status != BarrierWaiting || len(arriveA.Barrier.Arrived) != 1 {
+		t.Fatalf("first arrival should wait: %+v", arriveA)
+	}
+	duplicateResource := apply(t, f, Command{
+		Type: CmdBarrierArrive, Barrier: "phase", ExpectedRound: 1, Participant: "b",
+		Resource: "ra", Holder: "ha", Token: a.Token, Now: now.Add(time.Second),
+	})
+	if duplicateResource.OK {
+		t.Fatalf("same resource must not be registered twice")
+	}
+	unknown := apply(t, f, Command{
+		Type: CmdBarrierArrive, Barrier: "phase", ExpectedRound: 1, Participant: "x",
+		Resource: "rx", Holder: "hx", Token: 1, Now: now.Add(time.Second),
+	})
+	if unknown.OK {
+		t.Fatalf("unknown participant must be rejected")
+	}
+	arriveB := apply(t, f, Command{
+		Type: CmdBarrierArrive, Barrier: "phase", ExpectedRound: 1, Participant: "b",
+		Resource: "rb", Holder: "hb", Token: b.Token, Now: now.Add(2 * time.Second),
+	})
+	if !arriveB.OK || arriveB.Barrier.Status != BarrierCompleted || len(arriveB.Barrier.Arrived) != 2 {
+		t.Fatalf("second valid arrival completes barrier: %+v", arriveB)
+	}
+	retry := apply(t, f, Command{
+		Type: CmdBarrierArrive, Barrier: "phase", ExpectedRound: 1, Participant: "b",
+		Resource: "rb", Holder: "hb", Token: b.Token, Now: now.Add(3 * time.Second),
+	})
+	if !retry.OK || retry.Barrier.Status != BarrierCompleted {
+		t.Fatalf("identical arrival retry must be idempotent: %+v", retry)
+	}
+	wrongAdvance := apply(t, f, Command{Type: CmdBarrierAdvance, Barrier: "phase", ExpectedRound: 2, Now: now.Add(3 * time.Second)})
+	if wrongAdvance.OK {
+		t.Fatalf("advance with wrong round must be rejected")
+	}
+	advanced := apply(t, f, Command{Type: CmdBarrierAdvance, Barrier: "phase", ExpectedRound: 1, Now: now.Add(4 * time.Second)})
+	if !advanced.OK || advanced.Barrier.Round != 2 || advanced.Barrier.Status != BarrierWaiting || len(advanced.Barrier.Arrived) != 0 {
+		t.Fatalf("advance should start a clean round: %+v", advanced)
+	}
+	stale := apply(t, f, Command{
+		Type: CmdBarrierArrive, Barrier: "phase", ExpectedRound: 1, Participant: "a",
+		Resource: "ra", Holder: "ha", Token: a.Token, Now: now.Add(5 * time.Second),
+	})
+	if stale.OK {
+		t.Fatalf("old round arrival must be rejected")
+	}
+}
+
+func TestBarrierFailsWhenRegisteredLeaseChangesAndAdvanceClears(t *testing.T) {
+	f := New()
+	now := time.Unix(4000, 0)
+	apply(t, f, Command{Type: CmdBarrierCreate, Barrier: "phase", Participants: []string{"a", "b"}, Now: now})
+	l := apply(t, f, Command{Type: CmdAcquire, Resource: "ra", Holder: "ha", TTL: 5, Now: now})
+	arrived := apply(t, f, Command{
+		Type: CmdBarrierArrive, Barrier: "phase", ExpectedRound: 1, Participant: "a",
+		Resource: "ra", Holder: "ha", Token: l.Token, Now: now,
+	})
+	if !arrived.OK || arrived.Barrier.Status != BarrierWaiting {
+		t.Fatalf("arrival: %+v", arrived)
+	}
+
+	// The next operation observes the lease release using its replicated
+	// decision time and permanently fails this round. No substitute is added.
+	apply(t, f, Command{Type: CmdRelease, Resource: "ra", Holder: "ha", Token: l.Token, Now: now.Add(time.Second)})
+	q := apply(t, f, Command{Type: CmdBarrierQuery, Barrier: "phase", Now: now.Add(2 * time.Second)})
+	if q.Barrier == nil || q.Barrier.Status != BarrierFailed || q.Barrier.FailureReason == "" {
+		t.Fatalf("query should mark failed barrier: %+v", q)
+	}
+	arrivalAfterFailure := apply(t, f, Command{
+		Type: CmdBarrierArrive, Barrier: "phase", ExpectedRound: 1, Participant: "b",
+		Resource: "rb", Holder: "hb", Token: 1, Now: now.Add(3 * time.Second),
+	})
+	if arrivalAfterFailure.OK {
+		t.Fatalf("failed round must not accept a replacement")
+	}
+	advanced := apply(t, f, Command{Type: CmdBarrierAdvance, Barrier: "phase", ExpectedRound: 1, Now: now.Add(4 * time.Second)})
+	if !advanced.OK || advanced.Barrier.Round != 2 || len(advanced.Barrier.Arrived) != 0 || advanced.Barrier.FailureReason != "" {
+		t.Fatalf("failed terminal round should advance cleanly: %+v", advanced)
+	}
+}
+
+func TestBarrierSnapshotRestoreAndOldSnapshot(t *testing.T) {
+	f := New()
+	now := time.Unix(6000, 0)
+	create := apply(t, f, Command{Type: CmdBarrierCreate, Barrier: "phase", Participants: []string{"a", "b"}, Now: now})
+	if !create.OK {
+		t.Fatalf("create: %+v", create)
+	}
+	l := apply(t, f, Command{Type: CmdAcquire, Resource: "ra", Holder: "ha", TTL: 30, Now: now})
+	apply(t, f, Command{
+		Type: CmdBarrierArrive, Barrier: "phase", ExpectedRound: 1, Participant: "a",
+		Resource: "ra", Holder: "ha", Token: l.Token, Now: now,
+	})
+
+	var buf bytes.Buffer
+	snap, err := f.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snap.Persist(&fakeSink{&buf}); err != nil {
+		t.Fatal(err)
+	}
+	g := New()
+	if err := g.Restore(io.NopCloser(&buf)); err != nil {
+		t.Fatal(err)
+	}
+	q := apply(t, g, Command{Type: CmdBarrierQuery, Barrier: "phase", Now: now.Add(time.Second)})
+	if q.Barrier == nil || q.Barrier.Round != 1 || q.Barrier.Status != BarrierWaiting || len(q.Barrier.Arrived) != 1 {
+		t.Fatalf("barrier not restored: %+v", q)
+	}
+
+	old := bytes.NewBufferString(`{"leases":{},"token_bounds":{}}`)
+	h := New()
+	if err := h.Restore(io.NopCloser(old)); err != nil {
+		t.Fatalf("old snapshot restore: %v", err)
+	}
+	if missing := apply(t, h, Command{Type: CmdBarrierQuery, Barrier: "missing", Now: now}); missing.OK {
+		t.Fatalf("restored old snapshot should contain no barriers")
+	}
+}
+
 type fakeSink struct {
 	*bytes.Buffer
 }
